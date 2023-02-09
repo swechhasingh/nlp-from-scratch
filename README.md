@@ -6,4 +6,4 @@
 
 - [x] [Bigram Neural Network LM](https://nbviewer.org/github/swechhasingh/nlp-from-scratch/blob/main/bigram-nn-LM.ipynb)
 
-- [] Transformer based LM
+- [x] [Transformer based LM](https://nbviewer.org/github/swechhasingh/nlp-from-scratch/blob/main/transformer_LM.ipynb)
