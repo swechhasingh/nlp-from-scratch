@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 # Let's modify our baseline bigram neural netwrok model with position embedding layer
-class TransformerLanguageModel(nn.Module):
+class Transformer(nn.Module):
     def __init__(
         self, vocab_size, block_size, model_dim, n_layer, n_head, causal_attention
     ) -> None:
@@ -80,6 +80,36 @@ class TransformerEncoderBlock(nn.Module):
         return x
 
 
+class TransformerDecoderBlock(nn.Module):
+    def __init__(self, n_head, model_dim, block_size, cross_attention=False) -> None:
+        super().__init__()
+        self.n_head = n_head
+        self.cross_attention = cross_attention
+        self.multi_head_self_attn_layer = MultiHeadAttention(
+            n_head, model_dim, block_size, causal_attention=True
+        )
+        self.self_attn_layer_norm = nn.LayerNorm(model_dim)
+
+        if self.cross_attention:
+            self.multi_head_cross_attn_layer = MultiHeadAttention(
+                n_head, model_dim, block_size, causal_attention=False
+            )
+            self.cross_attn_layer_norm = nn.LayerNorm(model_dim)
+
+        self.ff_layer = PositionWiseFeedForwardNetwork(model_dim)
+        self.ffn_layer_norm = nn.LayerNorm(model_dim)
+
+    def forward(self, x, encoder_output=None):
+        x = x + self.multi_head_self_attn_layer(self.self_attn_layer_norm(x))
+        if self.cross_attention:
+            x = x + self.multi_head_cross_attn_layer(
+                self.cross_attn_layer_norm(x),
+                self.cross_attn_layer_norm(encoder_output),
+            )
+        x = x + self.ff_layer(self.ffn_layer_norm(x))
+        return x
+
+
 class PositionWiseFeedForwardNetwork(nn.Module):
     def __init__(self, model_dim) -> None:
         super().__init__()
@@ -106,9 +136,9 @@ class MultiHeadAttention(nn.Module):
         )
         self.linear_proj = nn.Linear(model_dim, model_dim)
 
-    def forward(self, x):
+    def forward(self, x, encoder_output=None):
         # TODO:  # parallelizable
-        head_out = torch.cat([head(x) for head in self.heads], dim=-1)
+        head_out = torch.cat([head(x, encoder_output) for head in self.heads], dim=-1)
         return self.linear_proj(head_out)
 
 
@@ -129,11 +159,15 @@ class Head(nn.Module):
                 "tril", torch.tril(torch.ones(block_size, block_size))
             )  # max context length = block_size
 
-    def forward(self, x):
+    def forward(self, x, encoder_output=None):
         B, T, C = x.shape  # T is sequence length
         Q = self.query(x)  # (batch_size, T, head_dim)
-        K = self.key(x)  # (batch_size, T, head_dim)
-        V = self.value(x)  # (batch_size, T, head_dim)
+        if encoder_output is None:
+            K = self.key(x)  # (batch_size, T, head_dim)
+            V = self.value(x)  # (batch_size, T, head_dim)
+        else:
+            K = self.key(encoder_output)  # (batch_size, T, head_dim)
+            V = self.value(encoder_output)  # (batch_size, T, head_dim)
 
         # scaled_dot_product_attention
         # MatMul
