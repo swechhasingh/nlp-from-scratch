@@ -5,7 +5,13 @@ import torch.nn.functional as F
 # Let's modify our baseline bigram neural netwrok model with position embedding layer
 class Transformer(nn.Module):
     def __init__(
-        self, vocab_size, block_size, model_dim, n_layer, n_head, causal_attention
+        self,
+        vocab_size,
+        block_size,
+        model_dim,
+        n_layer,
+        n_head,
+        cross_attention,
     ) -> None:
         super().__init__()
         self.block_size = block_size  # max context length
@@ -17,32 +23,53 @@ class Transformer(nn.Module):
         self.pos_embed_layer = nn.Embedding(
             block_size, model_dim
         )  # input: (T,) output: (T, model_dim)
-        # Stacked Transformer Blocks
-        self.layers = nn.Sequential(
+        # Stacked Transformer Encoder Blocks
+        self.encoder_layers = nn.Sequential(
             *[
-                TransformerEncoderBlock(n_head, model_dim, block_size, causal_attention)
+                TransformerEncoderBlock(n_head, model_dim, block_size)
+                for _ in range(n_layer)
+            ]
+        )
+
+        self.decoder_layers = nn.Sequential(
+            *[
+                TransformerDecoderBlock(n_head, model_dim, block_size, cross_attention)
                 for _ in range(n_layer)
             ]
         )
 
         self.out_linear_proj = nn.Linear(model_dim, vocab_size)
 
-    def forward(self, idx, target=None):
-        B, T = idx.shape  # idx: (B, T) T is sequence length
-        token_emb = self.token_embed_layer(idx)
-        pos_emb = self.pos_embed_layer(torch.arange(T, device=idx.device))
+    def forward(self, src, target):
+        B, T = src.shape  # idx: (B, T) T is sequence length
+        inp_token_emb = self.token_embed_layer(src)
+        inp_pos_emb = self.pos_embed_layer(torch.arange(T, device=src.device))
         # broadcast pos_emb along the batch dimension of token_emb
-        token_emb = token_emb + pos_emb
+        inp_token_emb = inp_token_emb + inp_pos_emb
 
-        logits = self.out_linear_proj(self.layers(token_emb))
+        decoder_inp = target[:, :-1]
+        decoder_target = target[:, 1:]
+        assert decoder_inp.shape[1] == decoder_target.shape[1], "size doesn't match"
 
-        if target is None:
+        B, T = decoder_inp.shape  # idx: (B, T) T is sequence length
+        target_token_emb = self.token_embed_layer(decoder_inp)
+        target_pos_emb = self.pos_embed_layer(
+            torch.arange(T, device=decoder_inp.device)
+        )
+        # broadcast pos_emb along the batch dimension of token_emb
+        target_token_emb = target_token_emb + target_pos_emb
+
+        encoder_output = self.encoder_layers(inp_token_emb)
+        decoder_output = self.encoder_layers(target_token_emb, encoder_output)
+        logits = self.out_linear_proj(decoder_output)
+
+        if decoder_target is None:
             loss = None
         else:
             B, T, C = logits.shape
             logits = logits.view(B * T, C)
-            target = target.view(B * T)
-            loss = F.cross_entropy(logits, target)
+            decoder_target = decoder_target.view(B * T)
+            loss = F.cross_entropy(logits, decoder_target)
         return logits, loss
 
     def generate(self, idx, max_token):
