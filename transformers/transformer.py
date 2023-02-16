@@ -16,7 +16,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.block_size = block_size  # max context length
         self.model_dim = model_dim
-        self.vocab_size = vocab_size
+        self.vocab_size = vocab_size  # total uniques words in src and target language
         self.token_embed_layer = nn.Embedding(
             vocab_size, model_dim
         )  # input: (B, T) output: (B, T, model_dim)
@@ -40,39 +40,35 @@ class Transformer(nn.Module):
 
         self.out_linear_proj = nn.Linear(model_dim, vocab_size)
 
-    def forward(self, src, target):
-        B, T = src.shape  # idx: (B, T) T is sequence length
-        inp_token_emb = self.token_embed_layer(src)
-        inp_pos_emb = self.pos_embed_layer(torch.arange(T, device=src.device))
+    def forward(self, enc_inp, enc_inp_mask, dec_inp, dec_target=None):
+        B, T_enc = enc_inp.shape  # idx: (B, T) T is sequence length
+        inp_token_emb = self.token_embed_layer(enc_inp)
+        inp_pos_emb = self.pos_embed_layer(torch.arange(T_enc, device=enc_inp.device))
         # broadcast pos_emb along the batch dimension of token_emb
         inp_token_emb = inp_token_emb + inp_pos_emb
 
-        decoder_inp = target[:, :-1]
-        decoder_target = target[:, 1:]
-        assert decoder_inp.shape[1] == decoder_target.shape[1], "size doesn't match"
-
-        B, T = decoder_inp.shape  # idx: (B, T) T is sequence length
-        target_token_emb = self.token_embed_layer(decoder_inp)
-        target_pos_emb = self.pos_embed_layer(
-            torch.arange(T, device=decoder_inp.device)
-        )
+        B, T_dec = dec_inp.shape  # idx: (B, T) T is sequence length
+        dec_token_emb = self.token_embed_layer(dec_inp)
+        dec_pos_emb = self.pos_embed_layer(torch.arange(T_dec, device=dec_inp.device))
         # broadcast pos_emb along the batch dimension of token_emb
-        target_token_emb = target_token_emb + target_pos_emb
+        dec_token_emb = dec_token_emb + dec_pos_emb
 
-        encoder_output = self.encoder_layers(inp_token_emb)
-        decoder_output = self.encoder_layers(target_token_emb, encoder_output)
+        encoder_output = self.encoder_layers(inp_token_emb, enc_inp_mask)
+        decoder_output = self.decoder_layers(
+            dec_token_emb, encoder_output, enc_inp_mask
+        )
         logits = self.out_linear_proj(decoder_output)
 
-        if decoder_target is None:
+        if dec_target is None:
             loss = None
         else:
             B, T, C = logits.shape
             logits = logits.view(B * T, C)
-            decoder_target = decoder_target.view(B * T)
-            loss = F.cross_entropy(logits, decoder_target)
+            dec_target = dec_target.view(B * T)
+            loss = F.cross_entropy(logits, dec_target)
         return logits, loss
 
-    def generate(self, idx, max_token):
+    def generate(self, enc_inp, max_token):
 
         for i in range(max_token):
             # block_size is the maximum context length of our LM, therefore we can only use last block_size characters as input to generate next character
@@ -101,8 +97,8 @@ class TransformerEncoderBlock(nn.Module):
         self.ff_layer = PositionWiseFeedForwardNetwork(model_dim)
         self.ffn_layer_norm = nn.LayerNorm(model_dim)
 
-    def forward(self, x):
-        x = x + self.multi_head_layer(self.head_layer_norm(x))
+    def forward(self, x, enc_inp_mask=None):
+        x = x + self.multi_head_layer(self.head_layer_norm(x), enc_inp_mask)
         x = x + self.ff_layer(self.ffn_layer_norm(x))
         return x
 
@@ -126,12 +122,13 @@ class TransformerDecoderBlock(nn.Module):
         self.ff_layer = PositionWiseFeedForwardNetwork(model_dim)
         self.ffn_layer_norm = nn.LayerNorm(model_dim)
 
-    def forward(self, x, encoder_output=None):
+    def forward(self, x, encoder_output=None, enc_inp_mask=None):
         x = x + self.multi_head_self_attn_layer(self.self_attn_layer_norm(x))
         if self.cross_attention:
             x = x + self.multi_head_cross_attn_layer(
                 self.cross_attn_layer_norm(x),
                 self.cross_attn_layer_norm(encoder_output),
+                enc_inp_mask,
             )
         x = x + self.ff_layer(self.ffn_layer_norm(x))
         return x
@@ -163,9 +160,11 @@ class MultiHeadAttention(nn.Module):
         )
         self.linear_proj = nn.Linear(model_dim, model_dim)
 
-    def forward(self, x, encoder_output=None):
+    def forward(self, x, encoder_output=None, enc_inp_mask=None):
         # TODO:  # parallelizable
-        head_out = torch.cat([head(x, encoder_output) for head in self.heads], dim=-1)
+        head_out = torch.cat(
+            [head(x, encoder_output, enc_inp_mask) for head in self.heads], dim=-1
+        )
         return self.linear_proj(head_out)
 
 
@@ -186,16 +185,24 @@ class Head(nn.Module):
                 "tril", torch.tril(torch.ones(block_size, block_size))
             )  # max context length = block_size
 
-    def forward(self, x, encoder_output=None):
+    def forward(self, x, encoder_output=None, enc_inp_mask=None):
         B, T, C = x.shape  # T is sequence length
         Q = self.query(x)  # (batch_size, T, head_dim)
+        # self-attention
         if encoder_output is None:
             K = self.key(x)  # (batch_size, T, head_dim)
             V = self.value(x)  # (batch_size, T, head_dim)
-        else:
+        else:  # cross-attention
+            # key and value from encoder output
             K = self.key(encoder_output)  # (batch_size, T, head_dim)
             V = self.value(encoder_output)  # (batch_size, T, head_dim)
 
+        """
+        in case of self/causal-attention:
+            weight_matrix:(batch_size, T, T)
+        in case of cross-attention:
+            weight_matrix:(batch_size, T_dec, T_enc)
+        """
         # scaled_dot_product_attention
         # MatMul
         weight_matrix = Q @ K.transpose(1, 2)
@@ -207,6 +214,12 @@ class Head(nn.Module):
             weight_matrix = weight_matrix.masked_fill(
                 self.tril[:T, :T] == 0, float("-inf")
             )
+        # in case of self-attention and cross-attention apply mask for variable length input sequences
+        if enc_inp_mask is not None:
+            # enc_inp_mask: (B, T) -> (B,1,T)
+            B, T_enc = enc_inp_mask.shape
+            enc_inp_mask = enc_inp_mask.view(B, 1, T_enc)
+            weight_matrix = weight_matrix.masked_fill(enc_inp_mask == 0, float("-inf"))
         # softmax; weight_matrix:(batch_size, T, T)
         weight_matrix = F.softmax(weight_matrix, dim=-1)
         # MatMul (weighted sum)
