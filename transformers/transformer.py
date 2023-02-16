@@ -68,21 +68,20 @@ class Transformer(nn.Module):
             loss = F.cross_entropy(logits, dec_target)
         return logits, loss
 
-    def generate(self, enc_inp, max_token):
-
+    def generate(self, enc_inp, dec_inp, max_token, enc_inp_mask=None):
+        EOS_token = 1
         for i in range(max_token):
             # block_size is the maximum context length of our LM, therefore we can only use last block_size characters as input to generate next character
-            logits, _ = self(
-                idx[:, -self.block_size :]
-            )  # idx: (B,T) logits: (B, T, vocab_size)
-            logits = logits[
-                :, -1, :
-            ]  # only last position token is required to generate next character
+            logits, _ = self(enc_inp, enc_inp_mask, dec_inp, dec_target=None)
+            # dec_inp: (B,1) logits: (B, 1, vocab_size)
+
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
-            sample = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, sample), dim=1)
-        return idx
+            dec_out = torch.multinomial(probs, num_samples=1)
+            dec_inp = torch.cat((dec_inp, dec_out), dim=1)
+            if dec_out.item() == EOS_token:
+                return dec_inp
+        return dec_inp
 
 
 class TransformerEncoderBlock(nn.Module):
