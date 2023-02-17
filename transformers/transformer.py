@@ -80,6 +80,7 @@ class Transformer(nn.Module):
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
             dec_out = torch.multinomial(probs, num_samples=1)
+            # print(dec_inp.shape, dec_out.shape)
             dec_inp = torch.cat((dec_inp, dec_out), dim=1)
             if dec_out.item() == EOS_token:
                 return dec_inp
