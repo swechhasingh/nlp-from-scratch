@@ -11,7 +11,7 @@ class Transformer(nn.Module):
         model_dim,
         n_layer,
         n_head,
-        cross_attention,
+        cross_attention=True,
     ) -> None:
         super().__init__()
         self.block_size = block_size  # max context length
@@ -40,7 +40,7 @@ class Transformer(nn.Module):
 
         self.out_linear_proj = nn.Linear(model_dim, vocab_size)
 
-    def forward(self, enc_inp, enc_inp_mask, dec_inp, dec_target=None):
+    def forward(self, enc_inp, dec_inp, enc_inp_mask=None, dec_target=None):
         B, T_enc = enc_inp.shape  # idx: (B, T) T is sequence length
         inp_token_emb = self.token_embed_layer(enc_inp)
         inp_pos_emb = self.pos_embed_layer(torch.arange(T_enc, device=enc_inp.device))
@@ -53,10 +53,12 @@ class Transformer(nn.Module):
         # broadcast pos_emb along the batch dimension of token_emb
         dec_token_emb = dec_token_emb + dec_pos_emb
 
-        encoder_output = self.encoder_layers(inp_token_emb, enc_inp_mask)
-        decoder_output = self.decoder_layers(
-            dec_token_emb, encoder_output, enc_inp_mask
-        )
+        for layer in self.encoder_layers:
+            encoder_output = layer(inp_token_emb, enc_inp_mask)
+            inp_token_emb = encoder_output
+        for layer in self.decoder_layers:
+            decoder_output = layer(dec_token_emb, encoder_output, enc_inp_mask)
+            dec_token_emb = decoder_output
         logits = self.out_linear_proj(decoder_output)
 
         if dec_target is None:
@@ -64,7 +66,7 @@ class Transformer(nn.Module):
         else:
             B, T, C = logits.shape
             logits = logits.view(B * T, C)
-            dec_target = dec_target.view(B * T)
+            dec_target = dec_target.contiguous().view(B * T)
             loss = F.cross_entropy(logits, dec_target)
         return logits, loss
 
@@ -72,9 +74,9 @@ class Transformer(nn.Module):
         EOS_token = 1
         for i in range(max_token):
             # block_size is the maximum context length of our LM, therefore we can only use last block_size characters as input to generate next character
-            logits, _ = self(enc_inp, enc_inp_mask, dec_inp, dec_target=None)
-            # dec_inp: (B,1) logits: (B, 1, vocab_size)
-
+            logits, _ = self(enc_inp, dec_inp, enc_inp_mask)
+            # dec_inp: (B,T_dec) logits: (B, T_dec, vocab_size)
+            logits = logits[:, -1, :]
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
             dec_out = torch.multinomial(probs, num_samples=1)
@@ -97,7 +99,9 @@ class TransformerEncoderBlock(nn.Module):
         self.ffn_layer_norm = nn.LayerNorm(model_dim)
 
     def forward(self, x, enc_inp_mask=None):
-        x = x + self.multi_head_layer(self.head_layer_norm(x), enc_inp_mask)
+        x = x + self.multi_head_layer(
+            self.head_layer_norm(x), enc_inp_mask=enc_inp_mask
+        )
         x = x + self.ff_layer(self.ffn_layer_norm(x))
         return x
 
