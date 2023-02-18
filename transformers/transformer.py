@@ -214,7 +214,7 @@ class Head(nn.Module):
         weight_matrix = weight_matrix * self.head_dim ** (-0.5)
         # Mask for causal self-attention
         if self.causal_attention:
-            # mask: self.tril[:T, :T]
+            # mask: self.tril[:T, :T], broadcasted along batch axis
             weight_matrix = weight_matrix.masked_fill(
                 self.tril[:T, :T] == 0, float("-inf")
             )
