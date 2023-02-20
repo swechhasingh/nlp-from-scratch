@@ -154,78 +154,59 @@ class PositionWiseFeedForwardNetwork(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_head, model_dim, block_size, causal_attention) -> None:
         super().__init__()
+        self.model_dim = model_dim
         self.head_dim = model_dim // n_head
-        # TODO:  # parallelizable
-        self.heads = nn.ModuleList(
-            [
-                Head(self.head_dim, model_dim, block_size, causal_attention)
-                for _ in range(n_head)
-            ]
-        )
+        self.n_head = n_head
+        # parallelized multi-head attention implementation using matrix multiplication
+        self.query_proj = nn.Linear(model_dim, model_dim)
+        self.key_proj = nn.Linear(model_dim, model_dim)
+        self.value_proj = nn.Linear(model_dim, model_dim)
+
         self.linear_proj = nn.Linear(model_dim, model_dim)
 
-    def forward(self, x, encoder_output=None, enc_inp_mask=None):
-        # TODO:  # parallelizable
-        head_out = torch.cat(
-            [head(x, encoder_output, enc_inp_mask) for head in self.heads], dim=-1
+        self.attention = None
+
+    def forward(self, key, value, query, mask=None):
+        # query (input): (B,T,model_dim), query (output): (B,T,model_dim)
+        # rearrange query output in (B,T,n_head,head_dim) shape
+        # further transpose query to (B,n_head,T,head_dim) shape
+        B, T, model_dim = query.shape
+        query = (
+            self.query_proj(query)
+            .view(B, T, self.n_head, self.head_dim)
+            .transpose(1, 2)
         )
+        key = self.key_proj(key).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        value = (
+            self.value_proj(value)
+            .view(B, T, self.n_head, self.head_dim)
+            .transpose(1, 2)
+        )
+
+        # head_out: (B,T,n_head,head_dim)
+        head_out, self.attention = self.scaled_dot_product_attn(key, value, query, mask)
+        # concatenate outputs from all the heads
+        # head_out: (B,T,model_dim)
+        head_out = head_out.contiguous().view(B, T, self.n_head * self.head_dim)
+        # proj output: (B,T,model_dim)
         return self.linear_proj(head_out)
 
-
-class Head(nn.Module):
-    def __init__(self, head_dim, model_dim, block_size, causal_attention=False) -> None:
-        super().__init__()
-        self.head_dim = head_dim
-        self.model_dim = model_dim
-        self.block_size = block_size
-        self.causal_attention = causal_attention
-        # for each head, apply different learned linear transform on x to get query, key and value
-        self.query = nn.Linear(model_dim, head_dim, bias=False)
-        self.key = nn.Linear(model_dim, head_dim, bias=False)
-        self.value = nn.Linear(model_dim, head_dim, bias=False)
-        # for causal attention
-        if causal_attention:
-            self.register_buffer(
-                "tril", torch.tril(torch.ones(block_size, block_size))
-            )  # max context length = block_size
-
-    def forward(self, x, encoder_output=None, enc_inp_mask=None):
-        B, T, C = x.shape  # T is sequence length
-        Q = self.query(x)  # (batch_size, T, head_dim)
-        # self-attention
-        if encoder_output is None:
-            K = self.key(x)  # (batch_size, T, head_dim)
-            V = self.value(x)  # (batch_size, T, head_dim)
-        else:  # cross-attention
-            # key and value from encoder output
-            K = self.key(encoder_output)  # (batch_size, T, head_dim)
-            V = self.value(encoder_output)  # (batch_size, T, head_dim)
-
-        """
-        in case of self/causal-attention:
-            weight_matrix:(batch_size, T, T)
-        in case of cross-attention:
-            weight_matrix:(batch_size, T_dec, T_enc)
-        """
+    @staticmethod
+    def scaled_dot_product_attn(K, V, Q, mask=None):
+        head_dim = Q.shape[-1]
         # scaled_dot_product_attention
         # MatMul
-        weight_matrix = Q @ K.transpose(1, 2)
+        # before matrix multiplication, transpose K(key) to (B,n_head,head_dim,T)
+        weight_matrix = Q @ K.transpose(-2, -1)
+        # weight_matrix:(B,n_head,T,T)
         # Scale
-        weight_matrix = weight_matrix * self.head_dim ** (-0.5)
-        # Mask for causal self-attention
-        if self.causal_attention:
-            # mask: self.tril[:T, :T], broadcasted along batch axis
-            weight_matrix = weight_matrix.masked_fill(
-                self.tril[:T, :T] == 0, float("-inf")
-            )
-        # in case of self-attention and cross-attention apply mask for variable length input sequences
-        if enc_inp_mask is not None:
-            # enc_inp_mask: (B, T) -> (B,1,T)
-            B, T_enc = enc_inp_mask.shape
-            enc_inp_mask = enc_inp_mask.view(B, 1, T_enc)
-            weight_matrix = weight_matrix.masked_fill(enc_inp_mask == 0, float("-inf"))
-        # softmax; weight_matrix:(batch_size, T, T)
+        weight_matrix = weight_matrix * head_dim ** (-0.5)
+        # apply mask
+        weight_matrix = weight_matrix.masked_fill(mask == 0, float("-inf"))
+        # apply softmax on last dim
         weight_matrix = F.softmax(weight_matrix, dim=-1)
-        # MatMul (weighted sum)
-        out = weight_matrix @ V  # out: (batch_size, T, head_dim)
-        return out
+        # MatMul (weighted sum of V to get a representation for every input location)
+        # V: (B,n_head,T,head_dim), out: (B,n_head,T,head_dim)
+        out = weight_matrix @ V
+        # out: (B,T,n_head,head_dim)
+        return out.transpose(1, 2), weight_matrix
