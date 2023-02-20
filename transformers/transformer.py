@@ -88,33 +88,28 @@ class Transformer(nn.Module):
 
 
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, n_head, model_dim, block_size) -> None:
+    def __init__(self, n_head, model_dim) -> None:
         super().__init__()
         self.n_head = n_head
-        self.multi_head_layer = MultiHeadAttention(
-            n_head, model_dim, block_size, causal_attention=False
-        )
-        self.head_layer_norm = nn.LayerNorm(model_dim)
+        self.multi_head_layer = MultiHeadAttention(n_head, model_dim)
+        self.mh_layer_norm = nn.LayerNorm(model_dim)
 
         self.ff_layer = PositionWiseFeedForwardNetwork(model_dim)
-        self.ffn_layer_norm = nn.LayerNorm(model_dim)
+        self.ff_layer_norm = nn.LayerNorm(model_dim)
 
-    def forward(self, x, enc_inp_mask=None):
-        x = x + self.multi_head_layer(
-            self.head_layer_norm(x), enc_inp_mask=enc_inp_mask
-        )
-        x = x + self.ff_layer(self.ffn_layer_norm(x))
+    def forward(self, x, mask=None):
+        # LayerNorm(x + Sublayer(x))
+        x_norm = self.mh_layer_norm(x)
+        x = x + self.multi_head_layer(x_norm, x_norm, x_norm, mask)
+        x = x + self.ff_layer(self.ff_layer_norm(x))
         return x
 
 
 class TransformerDecoderBlock(nn.Module):
-    def __init__(self, n_head, model_dim, block_size, cross_attention=False) -> None:
+    def __init__(self, n_head, model_dim, cross_attention=False) -> None:
         super().__init__()
         self.n_head = n_head
-        self.cross_attention = cross_attention
-        self.multi_head_self_attn_layer = MultiHeadAttention(
-            n_head, model_dim, block_size, causal_attention=True
-        )
+        self.multi_head_self_attn_layer = MultiHeadAttention(n_head, model_dim)
         self.self_attn_layer_norm = nn.LayerNorm(model_dim)
 
         if self.cross_attention:
@@ -152,7 +147,7 @@ class PositionWiseFeedForwardNetwork(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_head, model_dim, block_size, causal_attention) -> None:
+    def __init__(self, n_head, model_dim) -> None:
         super().__init__()
         self.model_dim = model_dim
         self.head_dim = model_dim // n_head
@@ -201,7 +196,7 @@ class MultiHeadAttention(nn.Module):
         # weight_matrix:(B,n_head,T,T)
         # Scale
         weight_matrix = weight_matrix * head_dim ** (-0.5)
-        # apply mask
+        # apply mask, mask:(B,1,T,T) or (B,1,1,T)
         weight_matrix = weight_matrix.masked_fill(mask == 0, float("-inf"))
         # apply softmax on last dim
         weight_matrix = F.softmax(weight_matrix, dim=-1)
