@@ -3,10 +3,11 @@ import torch
 import torch.nn.functional as F
 
 # Let's modify our baseline bigram neural netwrok model with position embedding layer
-class Transformer(nn.Module):
+class EncDecTransformer(nn.Module):
     def __init__(
         self,
-        vocab_size,
+        src_vocab_size,
+        tgt_vocab_size,
         block_size,
         model_dim,
         n_layer,
@@ -16,75 +17,116 @@ class Transformer(nn.Module):
         super().__init__()
         self.block_size = block_size  # max context length
         self.model_dim = model_dim
-        self.vocab_size = vocab_size  # total uniques words in src and target language
-        self.token_embed_layer = nn.Embedding(
-            vocab_size, model_dim
-        )  # input: (B, T) output: (B, T, model_dim)
-        self.pos_embed_layer = nn.Embedding(
-            block_size, model_dim
-        )  # input: (T,) output: (T, model_dim)
-        # Stacked Transformer Encoder Blocks
-        self.encoder_layers = nn.Sequential(
-            *[
-                TransformerEncoderBlock(n_head, model_dim, block_size)
-                for _ in range(n_layer)
-            ]
+        # input: (B, T) output: (B, T, model_dim)
+        self.src_embed = nn.Embedding(src_vocab_size, model_dim)
+        self.target_embed = nn.Embedding(tgt_vocab_size, model_dim)
+        # input: (T,) output: (T, model_dim)
+        self.pos_embed_layer = nn.Embedding(block_size, model_dim)
+
+        self.encoder = Encoder(n_head, model_dim, n_layer)
+        self.decoder = Decoder(n_head, model_dim, n_layer, cross_attention)
+
+        self.decoded_target_proj = nn.Linear(model_dim, tgt_vocab_size)
+
+    def encode(self, x, mask):
+
+        inp_token_emb = self.src_embed(x)
+        inp_pos_emb = self.pos_embed_layer(
+            torch.arange(self.block_size, device=x.device)
         )
-
-        self.decoder_layers = nn.Sequential(
-            *[
-                TransformerDecoderBlock(n_head, model_dim, block_size, cross_attention)
-                for _ in range(n_layer)
-            ]
-        )
-
-        self.out_linear_proj = nn.Linear(model_dim, vocab_size)
-
-    def forward(self, enc_inp, dec_inp, enc_inp_mask=None, dec_target=None):
-        B, T_enc = enc_inp.shape  # idx: (B, T) T is sequence length
-        inp_token_emb = self.token_embed_layer(enc_inp)
-        inp_pos_emb = self.pos_embed_layer(torch.arange(T_enc, device=enc_inp.device))
         # broadcast pos_emb along the batch dimension of token_emb
         inp_token_emb = inp_token_emb + inp_pos_emb
 
-        B, T_dec = dec_inp.shape  # idx: (B, T) T is sequence length
-        dec_token_emb = self.token_embed_layer(dec_inp)
-        dec_pos_emb = self.pos_embed_layer(torch.arange(T_dec, device=dec_inp.device))
+        return self.encoder(inp_token_emb, mask)
+
+    def decode(self, target, target_mask, memory, src_mask):
+        token_emb = self.target_embed(target)
+        pos_emb = self.pos_embed_layer(
+            torch.arange(target.shape[-1], device=target.device)
+        )
         # broadcast pos_emb along the batch dimension of token_emb
-        dec_token_emb = dec_token_emb + dec_pos_emb
+        token_emb = token_emb + pos_emb
 
-        for layer in self.encoder_layers:
-            encoder_output = layer(inp_token_emb, enc_inp_mask)
-            inp_token_emb = encoder_output
-        for layer in self.decoder_layers:
-            decoder_output = layer(dec_token_emb, encoder_output, enc_inp_mask)
-            dec_token_emb = decoder_output
-        logits = self.out_linear_proj(decoder_output)
+        return self.decoder(token_emb, target_mask, memory, src_mask)
 
-        if dec_target is None:
+    def forward(self, src, src_mask, target=None, target_mask=None, target_y=None):
+
+        memory = self.encode(src, src_mask)
+        dec_out = self.decode(target, target_mask, memory, src_mask)
+        logits = self.decoded_target_proj(dec_out)
+
+        if target_y is None:
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            dec_target = dec_target.contiguous().view(B * T)
-            loss = F.cross_entropy(logits, dec_target)
+            logits = logits.contiguous().view(B * T, C)
+            target_y = target_y.contiguous().view(B * T)
+            loss = F.cross_entropy(logits, target_y)
         return logits, loss
 
-    def generate(self, enc_inp, dec_inp, max_token, enc_inp_mask=None):
-        EOS_token = 1
-        for i in range(max_token):
+    def generate(self, src, src_mask, max_tokens=15, sos=0, eos=1):
+        memory = self.encode(src, src_mask)
+        tgt = torch.zeros(1, 1, dtype=src.dtype, device=src.device)
+
+        for i in range(max_tokens):
+            # causal attention mask: (1,T,T)
+            tgt_mask = torch.tril(
+                torch.ones(
+                    1,
+                    1,
+                    tgt.shape[-1],
+                    tgt.shape[-1],
+                    dtype=torch.bool,
+                    device=tgt.device,
+                )
+            )
             # block_size is the maximum context length of our LM, therefore we can only use last block_size characters as input to generate next character
-            logits, _ = self(enc_inp, dec_inp, enc_inp_mask)
+            dec_out = self.decode(tgt, tgt_mask, memory, src_mask)
+            logits = self.decoded_target_proj(dec_out)
             # dec_inp: (B,T_dec) logits: (B, T_dec, vocab_size)
             logits = logits[:, -1, :]
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
-            dec_out = torch.multinomial(probs, num_samples=1)
-            # print(dec_inp.shape, dec_out.shape)
-            dec_inp = torch.cat((dec_inp, dec_out), dim=1)
-            if dec_out.item() == EOS_token:
-                return dec_inp
-        return dec_inp
+            next_inp = torch.multinomial(probs, num_samples=1)
+            print(tgt.shape, next_inp.shape)
+            tgt = torch.cat((tgt, next_inp), dim=1)
+
+            if next_inp.item() == eos:
+                break
+        return tgt
+
+
+class Encoder(nn.Module):
+    def __init__(self, n_head, model_dim, n_layer) -> None:
+        super().__init__()
+        # Stacked Transformer Encoder Blocks
+        self.layers = nn.Sequential(
+            *[TransformerEncoderBlock(n_head, model_dim) for _ in range(n_layer)]
+        )
+        self.norm = nn.LayerNorm(model_dim)
+
+    def forward(self, x, mask=None):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, n_head, model_dim, n_layer, cross_attention) -> None:
+        super().__init__()
+        # Stacked Transformer Encoder Blocks
+        self.layers = nn.Sequential(
+            *[
+                TransformerDecoderBlock(n_head, model_dim, cross_attention)
+                for _ in range(n_layer)
+            ]
+        )
+        self.norm = nn.LayerNorm(model_dim)
+
+    def forward(self, x, target_mask, memory=None, src_mask=None):
+        for layer in self.layers:
+            x = layer(x, target_mask, memory, src_mask)
+        return self.norm(x)
 
 
 class TransformerEncoderBlock(nn.Module):
@@ -109,25 +151,32 @@ class TransformerDecoderBlock(nn.Module):
     def __init__(self, n_head, model_dim, cross_attention=False) -> None:
         super().__init__()
         self.n_head = n_head
-        self.multi_head_self_attn_layer = MultiHeadAttention(n_head, model_dim)
+        self.cross_attention = cross_attention
+        self.self_attn_layer = MultiHeadAttention(n_head, model_dim)
         self.self_attn_layer_norm = nn.LayerNorm(model_dim)
 
         if self.cross_attention:
-            self.multi_head_cross_attn_layer = MultiHeadAttention(
-                n_head, model_dim, block_size, causal_attention=False
-            )
+            self.cross_attn_layer = MultiHeadAttention(n_head, model_dim)
             self.cross_attn_layer_norm = nn.LayerNorm(model_dim)
 
         self.ff_layer = PositionWiseFeedForwardNetwork(model_dim)
         self.ffn_layer_norm = nn.LayerNorm(model_dim)
 
-    def forward(self, x, encoder_output=None, enc_inp_mask=None):
-        x = x + self.multi_head_self_attn_layer(self.self_attn_layer_norm(x))
+    def forward(
+        self,
+        x,
+        tgt_mask,
+        memory=None,
+        src_mask=None,
+    ):
+        x_norm = self.self_attn_layer_norm(x)
+        x = x + self.self_attn_layer(x_norm, x_norm, x_norm, tgt_mask)
         if self.cross_attention:
-            x = x + self.multi_head_cross_attn_layer(
-                self.cross_attn_layer_norm(x),
-                self.cross_attn_layer_norm(encoder_output),
-                enc_inp_mask,
+            x = x + self.cross_attn_layer(
+                self.cross_attn_layer_norm(x),  # query
+                memory,  # key
+                memory,  # value
+                src_mask,
             )
         x = x + self.ff_layer(self.ffn_layer_norm(x))
         return x
@@ -161,7 +210,7 @@ class MultiHeadAttention(nn.Module):
 
         self.attention = None
 
-    def forward(self, key, value, query, mask=None):
+    def forward(self, query, key, value, mask=None):
         # query (input): (B,T,model_dim), query (output): (B,T,model_dim)
         # rearrange query output in (B,T,n_head,head_dim) shape
         # further transpose query to (B,n_head,T,head_dim) shape
@@ -179,15 +228,18 @@ class MultiHeadAttention(nn.Module):
         )
 
         # head_out: (B,T,n_head,head_dim)
+        print(mask.shape)
         head_out, self.attention = self.scaled_dot_product_attn(key, value, query, mask)
+        print(head_out.shape)
         # concatenate outputs from all the heads
         # head_out: (B,T,model_dim)
         head_out = head_out.contiguous().view(B, T, self.n_head * self.head_dim)
+        print(head_out.shape)
         # proj output: (B,T,model_dim)
         return self.linear_proj(head_out)
 
     @staticmethod
-    def scaled_dot_product_attn(K, V, Q, mask=None):
+    def scaled_dot_product_attn(Q, K, V, mask=None):
         head_dim = Q.shape[-1]
         # scaled_dot_product_attention
         # MatMul
