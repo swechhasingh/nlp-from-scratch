@@ -73,7 +73,6 @@ class EncDecTransformer(nn.Module):
             tgt_mask = torch.tril(
                 torch.ones(
                     1,
-                    1,
                     tgt.shape[-1],
                     tgt.shape[-1],
                     dtype=torch.bool,
@@ -88,7 +87,6 @@ class EncDecTransformer(nn.Module):
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
             next_inp = torch.multinomial(probs, num_samples=1)
-            print(tgt.shape, next_inp.shape)
             tgt = torch.cat((tgt, next_inp), dim=1)
 
             if next_inp.item() == eos:
@@ -214,27 +212,24 @@ class MultiHeadAttention(nn.Module):
         # query (input): (B,T,model_dim), query (output): (B,T,model_dim)
         # rearrange query output in (B,T,n_head,head_dim) shape
         # further transpose query to (B,n_head,T,head_dim) shape
-        B, T, model_dim = query.shape
+        B, T_query, model_dim = query.shape
         query = (
             self.query_proj(query)
-            .view(B, T, self.n_head, self.head_dim)
+            .view(B, T_query, self.n_head, self.head_dim)
             .transpose(1, 2)
         )
-        key = self.key_proj(key).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        key = self.key_proj(key).view(B, -1, self.n_head, self.head_dim).transpose(1, 2)
         value = (
             self.value_proj(value)
-            .view(B, T, self.n_head, self.head_dim)
+            .view(B, -1, self.n_head, self.head_dim)
             .transpose(1, 2)
         )
 
         # head_out: (B,T,n_head,head_dim)
-        print(mask.shape)
-        head_out, self.attention = self.scaled_dot_product_attn(key, value, query, mask)
-        print(head_out.shape)
+        head_out, self.attention = self.scaled_dot_product_attn(query, key, value, mask)
         # concatenate outputs from all the heads
         # head_out: (B,T,model_dim)
-        head_out = head_out.contiguous().view(B, T, self.n_head * self.head_dim)
-        print(head_out.shape)
+        head_out = head_out.contiguous().view(B, T_query, self.n_head * self.head_dim)
         # proj output: (B,T,model_dim)
         return self.linear_proj(head_out)
 
