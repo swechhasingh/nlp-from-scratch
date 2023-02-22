@@ -20,3 +20,4 @@ mask = torch.tensor(
     [[[True, True, True, True, True, True, True, True, False, False, False, False]]]
 )
 out = mt_transformer.generate(inp, mask, max_tokens=11)
+print(out)

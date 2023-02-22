@@ -72,7 +72,7 @@ class EncDecTransformer(nn.Module):
             # causal attention mask: (1,T,T)
             tgt_mask = torch.tril(
                 torch.ones(
-                    1,
+                    # 1,
                     tgt.shape[-1],
                     tgt.shape[-1],
                     dtype=torch.bool,
