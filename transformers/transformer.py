@@ -49,7 +49,15 @@ class EncDecTransformer(nn.Module):
 
         return self.decoder(token_emb, target_mask, memory, src_mask)
 
-    def forward(self, src, src_mask, target=None, target_mask=None, target_y=None):
+    def forward(
+        self,
+        src,
+        src_mask,
+        target=None,
+        target_mask=None,
+        target_y=None,
+        target_pad_mask=None,
+    ):
 
         memory = self.encode(src, src_mask)
         dec_out = self.decode(target, target_mask, memory, src_mask)
@@ -61,7 +69,10 @@ class EncDecTransformer(nn.Module):
             B, T, C = logits.shape
             logits = logits.contiguous().view(B * T, C)
             target_y = target_y.contiguous().view(B * T)
-            loss = F.cross_entropy(logits, target_y)
+            loss = F.cross_entropy(logits, target_y, reduction="none")
+            # padding mask: (B,1,T)
+            n_tokens = target_pad_mask.sum().item()
+            loss = (loss * target_pad_mask.contiguous().view(B * T)).sum() / n_tokens
         return logits, loss
 
     def generate(self, src, src_mask, max_tokens=15, sos=0, eos=1):
